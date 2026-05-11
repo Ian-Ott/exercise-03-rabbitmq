@@ -5,9 +5,14 @@ from sqlalchemy.orm import Session
 from src.database import Base, engine, get_db
 from src.models import Node
 from src.schemas import NodeCreate, NodeResponse, NodeUpdate
+import pika
+import os
+import time
+import json
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
+RABBITMQ_URL = os.getenv("RABBITMQ_URL")
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
@@ -28,6 +33,7 @@ def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     db.add(db_node)
     db.commit()
     db.refresh(db_node)
+    publicarEvento("register",node.name)
     return db_node
 
 @app.get("/api/nodes", response_model=list[NodeResponse])
@@ -63,6 +69,7 @@ def delete_node(name: str, db: Session = Depends(get_db)):
     node.status = "inactive"
     node.updated_at = datetime.now(timezone.utc)
     db.commit()
+    publicarEvento("delete", name)
     return Response(status_code=204)
 
 # TODO: After each POST /api/nodes (register) and DELETE /api/nodes/{name},
@@ -71,3 +78,44 @@ def delete_node(name: str, db: Session = Depends(get_db)):
 #
 # Use pika to connect to RabbitMQ at RABBITMQ_URL env var.
 # Queue name: "node_events"
+def publicarEvento(evento, nombre):
+    connection = conectar_con_reintento()
+    try:
+        channel = connection.channel()
+
+        # Declarar cola durable
+        channel.queue_declare(queue='node_events', durable=True)
+        if(evento == "register"):
+            mensaje = {
+                "event": "node_registered",
+                "node_name": nombre,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        elif(evento == "delete"):
+            mensaje = {
+                "event": "node_deleted",
+                "node_name": nombre,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        else:
+            return
+        channel.basic_publish(
+            exchange='',
+            routing_key='node_events',
+            body=json.dumps(mensaje).encode(),
+            properties=pika.BasicProperties(
+            delivery_mode=2
+            )
+        )
+    finally:
+        connection.close()
+
+def conectar_con_reintento():
+    while True:
+        try:
+            connection = pika.BlockingConnection(
+                pika.URLParameters(RABBITMQ_URL)
+            )
+            return connection
+        except Exception as e:
+            time.sleep(3)
